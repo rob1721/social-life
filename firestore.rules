@@ -1,0 +1,142 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function me() { return request.auth.uid; }
+    function myEmail() { return request.auth.token.email.lower(); }
+
+    function changed() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    function circleData(circleId) {
+      return get(/databases/$(database)/documents/circles/$(circleId)).data;
+    }
+
+    function isMember(circleId) {
+      return signedIn() && me() in circleData(circleId).memberIds;
+    }
+
+    // Verdadero si, entre `before` y `after`, solo se agregó/quitó mi uid.
+    function onlyMyselfToggled(before, after) {
+      let b = before.toSet();
+      let a = after.toSet();
+      return a.difference(b).union(b.difference(a)).hasOnly([me()]);
+    }
+
+    // ---------- Usuarios ----------
+    match /users/{userId} {
+      allow read: if signedIn();
+
+      // Nombre y correo deben venir del token de Google: nadie puede
+      // suplantarlos con un apodo.
+      allow create: if signedIn() && userId == me()
+        && request.resource.data.uid == me()
+        && request.resource.data.email == myEmail()
+        && request.resource.data.googleName == request.auth.token.get('name', request.resource.data.googleName);
+
+      allow update: if signedIn() && userId == me()
+        && !changed().hasAny(['uid', 'email', 'createdAt'])
+        && (!changed().hasAny(['googleName'])
+            || request.resource.data.googleName == request.auth.token.get('name', ''));
+
+      allow delete: if false;
+
+      // Estado privado por evento (visto / dejar de recordar).
+      match /eventStates/{stateId} {
+        allow read, write: if signedIn() && userId == me();
+      }
+    }
+
+    // ---------- Redes (círculos) ----------
+    match /circles/{circleId} {
+      allow read: if signedIn() && me() in resource.data.memberIds;
+
+      allow create: if signedIn()
+        && request.resource.data.ownerId == me()
+        && request.resource.data.memberIds == [me()];
+
+      allow update: if signedIn() && (
+        // El dueño administra la red (no puede transferirla).
+        (resource.data.ownerId == me() && request.resource.data.ownerId == me())
+        // Unirme con una invitación pendiente.
+        || (changed().hasOnly(['memberIds'])
+            && !(me() in resource.data.memberIds)
+            && request.resource.data.memberIds.toSet()
+                 == resource.data.memberIds.toSet().union([me()].toSet())
+            && get(/databases/$(database)/documents/invites/$(circleId + '_' + myEmail())).data.status == 'pending')
+        // Salir de la red (el dueño no puede salir de la suya).
+        || (changed().hasOnly(['memberIds'])
+            && resource.data.ownerId != me()
+            && me() in resource.data.memberIds
+            && request.resource.data.memberIds.toSet()
+                 == resource.data.memberIds.toSet().difference([me()].toSet()))
+      );
+
+      allow delete: if signedIn() && resource.data.ownerId == me()
+        && circleId != me();
+
+      // ---------- Eventos ----------
+      match /events/{eventId} {
+        allow read: if isMember(circleId);
+
+        allow create: if isMember(circleId)
+          && request.resource.data.ownerId == me()
+          && request.resource.data.circleId == circleId
+          && request.resource.data.title is string
+          && request.resource.data.title.size() > 0
+          && request.resource.data.endAt >= request.resource.data.startAt;
+
+        allow update: if isMember(circleId) && (
+          // El creador edita su evento.
+          (resource.data.ownerId == me()
+            && request.resource.data.ownerId == me()
+            && request.resource.data.circleId == circleId
+            && request.resource.data.endAt >= request.resource.data.startAt)
+          // Cualquier miembro cambia SOLO su participación.
+          || (changed().hasOnly(['participantIds', 'declinedIds', 'updatedAt'])
+              && onlyMyselfToggled(resource.data.participantIds, request.resource.data.participantIds)
+              && onlyMyselfToggled(resource.data.declinedIds, request.resource.data.declinedIds))
+          // Registrar actividad al agregar un post.
+          || (changed().hasOnly(['lastActivityAt', 'lastActivityBy'])
+              && request.resource.data.lastActivityBy == me())
+        );
+
+        allow delete: if isMember(circleId) && resource.data.ownerId == me();
+
+        // ---------- Material del evento ----------
+        match /posts/{postId} {
+          allow read: if isMember(circleId);
+          allow create: if isMember(circleId)
+            && request.resource.data.authorId == me();
+          allow update: if isMember(circleId)
+            && resource.data.authorId == me()
+            && request.resource.data.authorId == me();
+          allow delete: if isMember(circleId) && resource.data.authorId == me();
+        }
+      }
+    }
+
+    // ---------- Invitaciones ----------
+    // Id: {circleId}_{email}
+    match /invites/{inviteId} {
+      allow read: if signedIn()
+        && (resource.data.email == myEmail() || resource.data.invitedBy == me());
+
+      allow create: if signedIn()
+        && request.resource.data.invitedBy == me()
+        && request.resource.data.status == 'pending'
+        && isMember(request.resource.data.circleId)
+        && inviteId == request.resource.data.circleId + '_' + request.resource.data.email;
+
+      allow update: if signedIn()
+        && resource.data.email == myEmail()
+        && changed().hasOnly(['status', 'respondedAt'])
+        && request.resource.data.status in ['accepted', 'declined'];
+
+      allow delete: if signedIn() && resource.data.invitedBy == me();
+    }
+  }
+}

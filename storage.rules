@@ -1,0 +1,30 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isImage() {
+      return request.resource.contentType.matches('image/.*')
+        && request.resource.size < 10 * 1024 * 1024;
+    }
+
+    function isMember(circleId) {
+      return request.auth.uid in
+        firestore.get(/databases/(default)/documents/circles/$(circleId)).data.memberIds;
+    }
+
+    match /users/{userId}/{fileName} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.auth.uid == userId && isImage();
+    }
+
+    match /circles/{circleId}/events/{eventId}/{userId}/{fileName} {
+      allow read: if request.auth != null && isMember(circleId);
+      allow create, update: if request.auth != null
+        && request.auth.uid == userId
+        && isMember(circleId)
+        && isImage();
+      allow delete: if request.auth != null && request.auth.uid == userId;
+    }
+  }
+}
